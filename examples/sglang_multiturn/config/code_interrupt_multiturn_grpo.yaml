@@ -1,0 +1,34 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  max_prompt_length: 1024
+  max_response_length: 1024
+  train_batch_size: 256
+  return_raw_chat: True
+
+actor_rollout_ref:
+  hybrid_engine: True
+  rollout:
+    name: sglang
+    mode: async
+    multi_turn:
+      enable: True
+      max_assistant_turns: 5
+      # Update this to your own tool config endpoint/credentials.
+      tool_config_path: ./config/tool_config/sandbox_fusion_tool_config.yaml
+      code_interrupt:
+        # Registered in verl.experimental.agent_loop.code_interrupt_agent_loop
+        tool_name: code_interpreter
+        language: python
+        timeout: 30
+        max_interrupts: 8
+        result_max_length: 256
+        stop_sequences: ["</code>"]
+    agent:
+      default_agent_loop: code_interrupt_agent
