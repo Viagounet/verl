@@ -12,6 +12,7 @@ ARG INSTALL_ORANGE_CERTS=0
 ARG EXTRA_CA_CERT_B64=""
 ARG VERL_REPO=https://github.com/Viagounet/verl.git
 ARG VERL_REF=main
+ARG VERL_COMMIT_SHA=""
 ARG FILESDSL_REPO=https://github.com/Viagounet/FilesDSL.git
 ARG FILESDSL_REF=main
 ARG FLASH_ATTN_VERSION=2.8.1
@@ -61,7 +62,15 @@ RUN if [ -n "${EXTRA_CA_CERT_B64}" ]; then \
 
 WORKDIR /opt
 
-RUN git clone --depth 1 --branch "${VERL_REF}" "${VERL_REPO}" /opt/verl
+RUN if [ -n "${VERL_COMMIT_SHA}" ]; then \
+        echo "Cloning verl at commit ${VERL_COMMIT_SHA}" && \
+        git clone "${VERL_REPO}" /opt/verl && \
+        cd /opt/verl && \
+        git checkout "${VERL_COMMIT_SHA}" ; \
+    else \
+        echo "Cloning verl at ref ${VERL_REF}" && \
+        git clone --depth 1 --branch "${VERL_REF}" "${VERL_REPO}" /opt/verl ; \
+    fi
 
 # The base image already contains a compatible SGLang stack.
 # Install verl without [sglang] extras so core deps (e.g. ray) are present.
