@@ -201,6 +201,10 @@ multi_turn:
   # Number of repeat rollouts for each interaction
   num_repeat_rollouts: null
 
+  # Extra config namespace for code_interrupt_agent
+  # (e.g. tool_name, language, timeout, max_interrupts, include_stop_str_in_output)
+  code_interrupt: {}
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False

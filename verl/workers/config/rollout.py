@@ -13,7 +13,7 @@
 # limitations under the License.
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from omegaconf import MISSING
 
@@ -59,6 +59,8 @@ class MultiTurnConfig(BaseConfig):
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
+    # Extra options for code_interrupt_agent (e.g. tool_name/language/max_interrupts).
+    code_interrupt: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
