@@ -120,6 +120,38 @@ verl is fast with:
 - [PPO in verl](https://verl.readthedocs.io/en/latest/algo/ppo.html)
 - [GRPO in verl](https://verl.readthedocs.io/en/latest/algo/grpo.html)
 
+### Quick Start: FilesDSL with `code_interrupt_agent`
+
+1. Install FilesDSL in your runtime:
+
+```bash
+pip install "git+https://github.com/Viagounet/FilesDSL.git"
+```
+
+2. Use the FilesDSL tool config:
+
+```bash
+examples/sglang_multiturn/config/tool_config/filesdsl_tool_config.yaml
+```
+
+3. Enable `code_interrupt_agent` with FilesDSL overrides (example):
+
+```bash
+python3 -m verl.trainer.main_ppo \
+  --config-path examples/sglang_multiturn/config \
+  --config-name code_interrupt_multiturn_grpo \
+  actor_rollout_ref.rollout.multi_turn.tool_config_path="$PWD/examples/sglang_multiturn/config/tool_config/filesdsl_tool_config.yaml" \
+  actor_rollout_ref.rollout.agent.default_agent_loop=code_interrupt_agent \
+  actor_rollout_ref.rollout.multi_turn.code_interrupt.tool_name=filesdsl_execute \
+  actor_rollout_ref.rollout.multi_turn.code_interrupt.language=fdsl
+```
+
+4. Optional sanity check:
+
+```bash
+python3 -c "from filesdsl import execute_fdsl; print(execute_fdsl('print(1)', cwd='.', sandbox_root='.'))"
+```
+
 **Running a PPO example step-by-step:**
 
 - [Prepare Data for Post-Training](https://verl.readthedocs.io/en/latest/preparation/prepare_data.html)

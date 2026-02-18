@@ -1,0 +1,22 @@
+tools:
+  - class_name: "verl.tools.filesdsl_tool.FilesDSLTool"
+    config:
+      type: native
+      cwd: "."
+      sandbox_root: "."
+      default_timeout: 30
+      max_output_chars: 4000
+      accepted_languages: ["fdsl", "filesdsl", "python"]
+
+    tool_schema:
+      type: "function"
+      function:
+        name: "filesdsl_execute"
+        description: "Execute FilesDSL code and return the printed output."
+        parameters:
+          type: "object"
+          properties:
+            code:
+              type: "string"
+              description: "The FilesDSL script to execute."
+          required: ["code"]
