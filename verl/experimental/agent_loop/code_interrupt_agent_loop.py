@@ -69,6 +69,11 @@ class CodeInterruptAgentLoop(AgentLoopBase):
         # Some SGLang versions do not support include_stop_str_in_output in SamplingParams.
         self._include_stop_param_supported = True
         self._stop_on_code_close = "</code>" in self.stop_sequences
+        if rollout_cfg.name == "sglang" and rollout_cfg.get("skip_tokenizer_init", False) and self.stop_sequences:
+            raise ValueError(
+                "code_interrupt_agent with SGLang requires "
+                "`actor_rollout_ref.rollout.skip_tokenizer_init=False` when using stop sequences."
+            )
 
         tool_config_path = mt_cfg.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
@@ -229,8 +234,10 @@ class CodeInterruptAgentLoop(AgentLoopBase):
         if "include_stop_str_in_output" not in sampling_params:
             return False
         message = str(error).lower()
-        if "include_stop_str_in_output" not in message:
-            return False
+        # Different SGLang/Ray versions wrap this error differently; matching on
+        # include_stop_str_in_output is enough to safely trigger retry without it.
+        if "include_stop_str_in_output" in message:
+            return True
         unsupported_signatures = (
             "unexpected keyword argument",
             "unexpected keywork argument",

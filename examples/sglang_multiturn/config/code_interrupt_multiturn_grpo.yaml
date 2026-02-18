@@ -17,6 +17,8 @@ actor_rollout_ref:
   rollout:
     name: sglang
     mode: async
+    # Required by code_interrupt_agent: SGLang needs tokenizer initialized for stop-sequence tail handling.
+    skip_tokenizer_init: False
     multi_turn:
       enable: True
       max_assistant_turns: 5
