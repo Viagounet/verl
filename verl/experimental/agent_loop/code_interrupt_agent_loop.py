@@ -36,6 +36,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _CODE_RE = re.compile(r"<code>(.*?)</code>", re.DOTALL)
+_CODE_RE_OPEN_ENDED = re.compile(r"<code>(.*)$", re.DOTALL)
 
 
 @register("code_interrupt_agent")
@@ -64,6 +65,10 @@ class CodeInterruptAgentLoop(AgentLoopBase):
         self.timeout = code_interrupt_cfg.get("timeout", None)
         self.result_max_length = code_interrupt_cfg.get("result_max_length", mt_cfg.max_tool_response_length)
         self.stop_sequences = code_interrupt_cfg.get("stop_sequences", ["</code>"])
+        self.include_stop_str_in_output = code_interrupt_cfg.get("include_stop_str_in_output", True)
+        # Some SGLang versions do not support include_stop_str_in_output in SamplingParams.
+        self._include_stop_param_supported = True
+        self._stop_on_code_close = "</code>" in self.stop_sequences
 
         tool_config_path = mt_cfg.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
@@ -100,16 +105,35 @@ class CodeInterruptAgentLoop(AgentLoopBase):
         while len(response_mask) < self.response_length:
             interrupt_params = dict(sampling_params)
             interrupt_params.setdefault("stop", self.stop_sequences)
-            interrupt_params.setdefault("include_stop_str_in_output", True)
+            if self.include_stop_str_in_output and self._include_stop_param_supported:
+                interrupt_params.setdefault("include_stop_str_in_output", True)
 
             with simple_timer("generate_sequences", metrics):
-                output = await self.server_manager.generate(
-                    request_id=request_id,
-                    prompt_ids=prompt_ids,
-                    sampling_params=interrupt_params,
-                    image_data=None,
-                    video_data=None,
-                )
+                try:
+                    output = await self.server_manager.generate(
+                        request_id=request_id,
+                        prompt_ids=prompt_ids,
+                        sampling_params=interrupt_params,
+                        image_data=None,
+                        video_data=None,
+                    )
+                except Exception as e:
+                    if self._is_include_stop_param_unsupported(e, interrupt_params):
+                        self._include_stop_param_supported = False
+                        logger.warning(
+                            "SamplingParams does not support include_stop_str_in_output; "
+                            "retrying without it for code_interrupt_agent."
+                        )
+                        interrupt_params.pop("include_stop_str_in_output", None)
+                        output = await self.server_manager.generate(
+                            request_id=request_id,
+                            prompt_ids=prompt_ids,
+                            sampling_params=interrupt_params,
+                            image_data=None,
+                            video_data=None,
+                        )
+                    else:
+                        raise
 
             if metrics.get("num_preempted") is None:
                 metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
@@ -132,6 +156,14 @@ class CodeInterruptAgentLoop(AgentLoopBase):
                 lambda: self.tokenizer.decode(generated_ids, skip_special_tokens=True),
             )
             match = _CODE_RE.search(generated_text)
+            # Fallback when stop string is stripped from output by backend.
+            if (
+                match is None
+                and self._stop_on_code_close
+                and "<code>" in generated_text
+                and not (self.include_stop_str_in_output and self._include_stop_param_supported)
+            ):
+                match = _CODE_RE_OPEN_ENDED.search(generated_text)
             if match is None or interrupts >= self.max_interrupts:
                 break
 
@@ -191,3 +223,17 @@ class CodeInterruptAgentLoop(AgentLoopBase):
         finally:
             if instance_id is not None:
                 await tool.release(instance_id)
+
+    @staticmethod
+    def _is_include_stop_param_unsupported(error: Exception, sampling_params: dict[str, Any]) -> bool:
+        if "include_stop_str_in_output" not in sampling_params:
+            return False
+        message = str(error).lower()
+        if "include_stop_str_in_output" not in message:
+            return False
+        unsupported_signatures = (
+            "unexpected keyword argument",
+            "unexpected keywork argument",
+            "unexpected key",
+        )
+        return any(sig in message for sig in unsupported_signatures)
