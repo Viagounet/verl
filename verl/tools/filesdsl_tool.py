@@ -50,14 +50,16 @@ class FilesDSLTool(BaseTool):
         self.default_sandbox_root = config.get("sandbox_root", self.default_cwd)
         self.default_timeout = config.get("default_timeout", None)
         self.max_output_chars = int(config.get("max_output_chars", 4000))
-        accepted_languages = config.get("accepted_languages", ["fdsl", "filesdsl", "python"])
+        accepted_languages = config.get("accepted_languages", ["fdsl", "filesdsl", "python"]) or []
         self.accepted_languages = {str(lang).lower() for lang in accepted_languages}
         self.isolate_execution_process = bool(config.get("isolate_execution_process", True))
-        # Certain model-generated snippets can mutate process-wide state (e.g.
-        # stdio), which may crash the current Ray worker instead of returning a
-        # normal tool error. Keep these languages isolated in subprocesses by
-        # default even when global isolation is disabled.
-        force_isolate_languages = config.get("force_isolate_languages", ["fdsl", "filesdsl", "python"])
+        # FDSL scripts execute inside the FilesDSL interpreter (not arbitrary
+        # Python), so running them in-process avoids expensive per-call process
+        # startup in rollout workers. Keep explicit opt-in knobs so callers can
+        # force subprocess isolation if desired.
+        prefer_inprocess_languages = config.get("prefer_inprocess_languages", ["fdsl", "filesdsl"]) or []
+        self.prefer_inprocess_languages = {str(lang).lower() for lang in prefer_inprocess_languages}
+        force_isolate_languages = config.get("force_isolate_languages", ["python"]) or []
         self.force_isolate_languages = {str(lang).lower() for lang in force_isolate_languages}
         self.subprocess_start_method = str(config.get("subprocess_start_method", "spawn"))
         self._instance_dict: dict[str, dict[str, Any]] = {}
@@ -154,7 +156,7 @@ class FilesDSLTool(BaseTool):
         timeout: float | None,
         language: str,
     ) -> str:
-        should_isolate = self.isolate_execution_process or (language in self.force_isolate_languages)
+        should_isolate = self._should_isolate_execution(language)
         if should_isolate:
             run_coro = asyncio.to_thread(self._execute_in_subprocess, code, cwd, sandbox_root, timeout)
             return await run_coro
@@ -205,6 +207,14 @@ class FilesDSLTool(BaseTool):
         if status == "ok":
             return payload
         raise RuntimeError(payload)
+
+    def _should_isolate_execution(self, language: str) -> bool:
+        normalized_language = str(language).lower()
+        if normalized_language in self.force_isolate_languages:
+            return True
+        if normalized_language in self.prefer_inprocess_languages:
+            return False
+        return self.isolate_execution_process
 
     def _normalize_timeout(self, timeout: Any) -> float | None:
         if timeout is None or timeout == "":

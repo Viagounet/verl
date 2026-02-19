@@ -153,6 +153,12 @@ python3 -m verl.trainer.main_ppo \
 python3 -c "from filesdsl import execute_fdsl; print(execute_fdsl('print(1)', cwd='.', sandbox_root='.'))"
 ```
 
+If you see per-call tool timeouts in rollout workers, ensure FilesDSL runs in-process:
+
+```yaml
+prefer_inprocess_languages: ["fdsl", "filesdsl"]
+```
+
 **Running a PPO example step-by-step:**
 
 - [Prepare Data for Post-Training](https://verl.readthedocs.io/en/latest/preparation/prepare_data.html)
