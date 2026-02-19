@@ -14,7 +14,9 @@
 
 import asyncio
 import logging
+import multiprocessing as mp
 import os
+import queue
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -25,6 +27,18 @@ from .schemas import OpenAIFunctionToolSchema, ToolResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _execute_fdsl_worker(code: str, cwd: str | None, sandbox_root: str | None, result_queue: mp.Queue) -> None:
+    from filesdsl import execute_fdsl
+
+    try:
+        output = execute_fdsl(code, cwd=cwd, sandbox_root=sandbox_root)
+    except Exception as exc:
+        result_queue.put(("error", str(exc)))
+        return
+
+    result_queue.put(("ok", str(output)))
 
 
 class FilesDSLTool(BaseTool):
@@ -38,6 +52,8 @@ class FilesDSLTool(BaseTool):
         self.max_output_chars = int(config.get("max_output_chars", 4000))
         accepted_languages = config.get("accepted_languages", ["fdsl", "filesdsl", "python"])
         self.accepted_languages = {str(lang).lower() for lang in accepted_languages}
+        self.isolate_execution_process = bool(config.get("isolate_execution_process", True))
+        self.subprocess_start_method = str(config.get("subprocess_start_method", "spawn"))
         self._instance_dict: dict[str, dict[str, Any]] = {}
 
     async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, ToolResponse]:
@@ -94,7 +110,7 @@ class FilesDSLTool(BaseTool):
                 sandbox_root=sandbox_root,
                 timeout=timeout,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             return (
                 ToolResponse(text=f"FilesDSL execution timed out after {timeout} seconds."),
                 None,
@@ -130,6 +146,10 @@ class FilesDSLTool(BaseTool):
         sandbox_root: str | None,
         timeout: float | None,
     ) -> str:
+        if self.isolate_execution_process:
+            run_coro = asyncio.to_thread(self._execute_in_subprocess, code, cwd, sandbox_root, timeout)
+            return await run_coro
+
         run_coro = asyncio.to_thread(
             execute_fdsl,
             code,
@@ -139,6 +159,35 @@ class FilesDSLTool(BaseTool):
         if timeout is None:
             return await run_coro
         return await asyncio.wait_for(run_coro, timeout=timeout)
+
+    def _execute_in_subprocess(
+        self,
+        code: str,
+        cwd: str | None,
+        sandbox_root: str | None,
+        timeout: float | None,
+    ) -> str:
+        ctx = mp.get_context(self.subprocess_start_method)
+        result_queue = ctx.Queue(maxsize=1)
+        process = ctx.Process(target=_execute_fdsl_worker, args=(code, cwd, sandbox_root, result_queue))
+        process.start()
+        process.join(timeout)
+
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            raise TimeoutError
+
+        try:
+            status, payload = result_queue.get_nowait()
+        except queue.Empty:
+            if process.exitcode == 0:
+                return ""
+            raise RuntimeError(f"FilesDSL worker exited with code {process.exitcode}")
+
+        if status == "ok":
+            return payload
+        raise RuntimeError(payload)
 
     def _normalize_timeout(self, timeout: Any) -> float | None:
         if timeout is None or timeout == "":
