@@ -180,19 +180,27 @@ class FilesDSLTool(BaseTool):
         result_queue = ctx.Queue(maxsize=1)
         process = ctx.Process(target=_execute_fdsl_worker, args=(code, cwd, sandbox_root, result_queue))
         process.start()
-        process.join(timeout)
-
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            raise TimeoutError
-
         try:
-            status, payload = result_queue.get_nowait()
+            # Read result first (with timeout) to avoid queue/pipe backpressure
+            # deadlocks when large outputs are emitted from the subprocess.
+            # Joining before draining the queue can block until timeout.
+            if timeout is None:
+                status, payload = result_queue.get()
+            else:
+                status, payload = result_queue.get(timeout=timeout)
         except queue.Empty:
+            if process.is_alive():
+                process.terminate()
+                process.join()
+                raise TimeoutError
             if process.exitcode == 0:
                 return ""
             raise RuntimeError(f"FilesDSL worker exited with code {process.exitcode}")
+        finally:
+            process.join(timeout=1)
+            if process.is_alive():
+                process.terminate()
+                process.join()
 
         if status == "ok":
             return payload
