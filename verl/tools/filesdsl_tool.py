@@ -32,6 +32,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 def _execute_fdsl_worker(code: str, cwd: str | None, sandbox_root: str | None, result_queue: mp.Queue) -> None:
     from filesdsl import execute_fdsl
 
+    result_queue.put(("ready", ""))
+
     try:
         output = execute_fdsl(code, cwd=cwd, sandbox_root=sandbox_root)
     except Exception as exc:
@@ -60,6 +62,7 @@ class FilesDSLTool(BaseTool):
         force_isolate_languages = config.get("force_isolate_languages", ["fdsl", "filesdsl", "python"])
         self.force_isolate_languages = {str(lang).lower() for lang in force_isolate_languages}
         self.subprocess_start_method = str(config.get("subprocess_start_method", "spawn"))
+        self.subprocess_startup_timeout = self._normalize_timeout(config.get("subprocess_startup_timeout", 30))
         self._instance_dict: dict[str, dict[str, Any]] = {}
 
     async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, ToolResponse]:
@@ -181,6 +184,18 @@ class FilesDSLTool(BaseTool):
         process = ctx.Process(target=_execute_fdsl_worker, args=(code, cwd, sandbox_root, result_queue))
         process.start()
         try:
+            startup_timeout = self.subprocess_startup_timeout
+            if startup_timeout is None and timeout is not None:
+                startup_timeout = timeout
+
+            if startup_timeout is None:
+                ready_status, _ = result_queue.get()
+            else:
+                ready_status, _ = result_queue.get(timeout=startup_timeout)
+
+            if ready_status != "ready":
+                raise RuntimeError("FilesDSL worker failed to initialize")
+
             # Read result first (with timeout) to avoid queue/pipe backpressure
             # deadlocks when large outputs are emitted from the subprocess.
             # Joining before draining the queue can block until timeout.
