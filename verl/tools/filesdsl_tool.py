@@ -17,6 +17,8 @@ import logging
 import multiprocessing as mp
 import os
 import queue
+import threading
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -27,6 +29,7 @@ from .schemas import OpenAIFunctionToolSchema, ToolResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+_INPROCESS_EXECUTION_LOCK = threading.Lock()
 
 
 def _execute_fdsl_worker(code: str, cwd: str | None, sandbox_root: str | None, result_queue: mp.Queue) -> None:
@@ -41,6 +44,23 @@ def _execute_fdsl_worker(code: str, cwd: str | None, sandbox_root: str | None, r
     result_queue.put(("ok", str(output)))
 
 
+def _execute_fdsl_persistent_worker(task_queue: mp.Queue, result_queue: mp.Queue) -> None:
+    from filesdsl import execute_fdsl
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            return
+
+        request_id, code, cwd, sandbox_root = task
+        try:
+            output = execute_fdsl(code, cwd=cwd, sandbox_root=sandbox_root)
+        except Exception as exc:
+            result_queue.put((request_id, "error", str(exc)))
+            continue
+        result_queue.put((request_id, "ok", str(output)))
+
+
 class FilesDSLTool(BaseTool):
     """Execute FilesDSL snippets using ``filesdsl.execute_fdsl``."""
 
@@ -53,14 +73,13 @@ class FilesDSLTool(BaseTool):
         accepted_languages = config.get("accepted_languages", ["fdsl", "filesdsl", "python"]) or []
         self.accepted_languages = {str(lang).lower() for lang in accepted_languages}
         self.isolate_execution_process = bool(config.get("isolate_execution_process", True))
-        # FDSL scripts execute inside the FilesDSL interpreter (not arbitrary
-        # Python), so running them in-process avoids expensive per-call process
-        # startup in rollout workers. Keep explicit opt-in knobs so callers can
-        # force subprocess isolation if desired.
-        prefer_inprocess_languages = config.get("prefer_inprocess_languages", ["fdsl", "filesdsl"]) or []
+        prefer_inprocess_languages = config.get("prefer_inprocess_languages", []) or []
         self.prefer_inprocess_languages = {str(lang).lower() for lang in prefer_inprocess_languages}
         force_isolate_languages = config.get("force_isolate_languages", ["python"]) or []
         self.force_isolate_languages = {str(lang).lower() for lang in force_isolate_languages}
+        self.use_persistent_isolated_worker = bool(config.get("use_persistent_isolated_worker", True))
+        persistent_worker_languages = config.get("persistent_worker_languages", ["fdsl", "filesdsl"]) or []
+        self.persistent_worker_languages = {str(lang).lower() for lang in persistent_worker_languages}
         self.subprocess_start_method = str(config.get("subprocess_start_method", "spawn"))
         self._instance_dict: dict[str, dict[str, Any]] = {}
 
@@ -70,10 +89,7 @@ class FilesDSLTool(BaseTool):
         create_kwargs = kwargs.get("create_kwargs", {})
         cwd = create_kwargs.get("cwd", self.default_cwd)
         sandbox_root = create_kwargs.get("sandbox_root", self.default_sandbox_root)
-        self._instance_dict[instance_id] = {
-            "cwd": cwd,
-            "sandbox_root": sandbox_root,
-        }
+        self._instance_dict[instance_id] = self._build_instance_state(cwd=cwd, sandbox_root=sandbox_root)
         return instance_id, ToolResponse()
 
     @rollout_trace_op
@@ -113,6 +129,7 @@ class FilesDSLTool(BaseTool):
         try:
             output = await self._execute_with_timeout(
                 execute_fdsl=execute_fdsl,
+                instance_id=instance_id,
                 code=code,
                 cwd=cwd,
                 sandbox_root=sandbox_root,
@@ -144,12 +161,14 @@ class FilesDSLTool(BaseTool):
         return 0.0
 
     async def release(self, instance_id: str, **kwargs) -> None:
-        self._instance_dict.pop(instance_id, None)
+        instance_state = self._instance_dict.pop(instance_id, None)
+        self._shutdown_persistent_worker(instance_state)
 
     async def _execute_with_timeout(
         self,
         execute_fdsl,
         *,
+        instance_id: str,
         code: str,
         cwd: str | None,
         sandbox_root: str | None,
@@ -158,18 +177,150 @@ class FilesDSLTool(BaseTool):
     ) -> str:
         should_isolate = self._should_isolate_execution(language)
         if should_isolate:
-            run_coro = asyncio.to_thread(self._execute_in_subprocess, code, cwd, sandbox_root, timeout)
+            should_use_persistent_worker = (
+                self.use_persistent_isolated_worker and language in self.persistent_worker_languages
+            )
+            if should_use_persistent_worker:
+                run_coro = asyncio.to_thread(
+                    self._execute_in_persistent_subprocess,
+                    instance_id,
+                    code,
+                    cwd,
+                    sandbox_root,
+                    timeout,
+                )
+            else:
+                run_coro = asyncio.to_thread(self._execute_in_subprocess, code, cwd, sandbox_root, timeout)
             return await run_coro
 
-        run_coro = asyncio.to_thread(
-            execute_fdsl,
-            code,
-            cwd=cwd,
-            sandbox_root=sandbox_root,
-        )
+        run_coro = asyncio.to_thread(self._execute_inprocess, execute_fdsl, code, cwd, sandbox_root)
         if timeout is None:
             return await run_coro
         return await asyncio.wait_for(run_coro, timeout=timeout)
+
+    def _build_instance_state(self, cwd: str | None, sandbox_root: str | None) -> dict[str, Any]:
+        return {
+            "cwd": cwd,
+            "sandbox_root": sandbox_root,
+            "worker": None,
+            "worker_lock": threading.Lock(),
+        }
+
+    def _execute_inprocess(
+        self,
+        execute_fdsl,
+        code: str,
+        cwd: str | None,
+        sandbox_root: str | None,
+    ) -> str:
+        # filesdsl.execute_fdsl currently redirects process-wide stdout; serialize
+        # in-process executions to avoid cross-thread stdio races.
+        with _INPROCESS_EXECUTION_LOCK:
+            return execute_fdsl(code, cwd=cwd, sandbox_root=sandbox_root)
+
+    def _execute_in_persistent_subprocess(
+        self,
+        instance_id: str,
+        code: str,
+        cwd: str | None,
+        sandbox_root: str | None,
+        timeout: float | None,
+    ) -> str:
+        instance_state = self._instance_dict.get(instance_id)
+        if instance_state is None:
+            instance_state = self._build_instance_state(cwd=cwd, sandbox_root=sandbox_root)
+            self._instance_dict[instance_id] = instance_state
+
+        with instance_state["worker_lock"]:
+            worker = self._ensure_persistent_worker(instance_state)
+            request_id = str(uuid4())
+            worker["task_queue"].put((request_id, code, cwd, sandbox_root))
+
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while True:
+                wait_timeout = 0.1
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._shutdown_persistent_worker(instance_state)
+                        raise TimeoutError
+                    wait_timeout = min(wait_timeout, remaining)
+
+                try:
+                    response_request_id, status, payload = worker["result_queue"].get(timeout=wait_timeout)
+                except queue.Empty:
+                    if not worker["process"].is_alive():
+                        exitcode = worker["process"].exitcode
+                        self._shutdown_persistent_worker(instance_state)
+                        raise RuntimeError(f"FilesDSL worker exited with code {exitcode}")
+                    continue
+
+                if response_request_id != request_id:
+                    # Ignore stale responses from previous requests.
+                    continue
+
+                if status == "ok":
+                    return payload
+                raise RuntimeError(payload)
+
+    def _ensure_persistent_worker(self, instance_state: dict[str, Any]) -> dict[str, Any]:
+        worker = instance_state.get("worker")
+        if worker is not None and worker["process"].is_alive():
+            return worker
+
+        self._shutdown_persistent_worker(instance_state)
+
+        ctx = mp.get_context(self.subprocess_start_method)
+        task_queue = ctx.Queue(maxsize=1)
+        result_queue = ctx.Queue(maxsize=1)
+        process = ctx.Process(target=_execute_fdsl_persistent_worker, args=(task_queue, result_queue))
+        process.start()
+
+        worker = {
+            "task_queue": task_queue,
+            "result_queue": result_queue,
+            "process": process,
+        }
+        instance_state["worker"] = worker
+        return worker
+
+    def _shutdown_persistent_worker(self, instance_state: dict[str, Any] | None) -> None:
+        if not instance_state:
+            return
+
+        worker = instance_state.get("worker")
+        if worker is None:
+            return
+
+        process = worker.get("process")
+        task_queue = worker.get("task_queue")
+        result_queue = worker.get("result_queue")
+
+        try:
+            if process is not None and process.is_alive():
+                try:
+                    task_queue.put_nowait(None)
+                except Exception:
+                    pass
+                process.join(timeout=0.2)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=1)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=1)
+        finally:
+            try:
+                if task_queue is not None:
+                    task_queue.close()
+            except Exception:
+                pass
+            try:
+                if result_queue is not None:
+                    result_queue.close()
+            except Exception:
+                pass
+            instance_state["worker"] = None
 
     def _execute_in_subprocess(
         self,
@@ -215,6 +366,10 @@ class FilesDSLTool(BaseTool):
         if normalized_language in self.prefer_inprocess_languages:
             return False
         return self.isolate_execution_process
+
+    def __del__(self):
+        for instance_state in list(self._instance_dict.values()):
+            self._shutdown_persistent_worker(instance_state)
 
     def _normalize_timeout(self, timeout: Any) -> float | None:
         if timeout is None or timeout == "":

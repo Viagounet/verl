@@ -7,9 +7,10 @@ tools:
       default_timeout: 30
       max_output_chars: 4000
       accepted_languages: ["fdsl", "filesdsl", "python"]
-      # Keep FilesDSL execution in-process to avoid multiprocessing startup
-      # overhead in agent loops. Set [] to disable this optimization.
-      prefer_inprocess_languages: ["fdsl", "filesdsl"]
+      # Keep FDSL in isolated subprocesses (segfault guard), but reuse a
+      # persistent worker per tool instance to avoid spawn-on-every-call cost.
+      use_persistent_isolated_worker: true
+      persistent_worker_languages: ["fdsl", "filesdsl"]
 
     tool_schema:
       type: "function"

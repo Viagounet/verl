@@ -106,30 +106,19 @@ class CodeInterruptAgentLoop(AgentLoopBase):
         turn_scores: list[float] = []
         assistant_turns = 0
         interrupts = 0
+        tool_kwargs = kwargs.get("tools_kwargs", {}).get(self.code_tool.name, {})
+        instance_id = None
+        try:
+            instance_id, _ = await self.code_tool.create(create_kwargs=tool_kwargs.get("create_kwargs", {}))
 
-        while len(response_mask) < self.response_length:
-            interrupt_params = dict(sampling_params)
-            interrupt_params.setdefault("stop", self.stop_sequences)
-            if self.include_stop_str_in_output and self._include_stop_param_supported:
-                interrupt_params.setdefault("include_stop_str_in_output", True)
+            while len(response_mask) < self.response_length:
+                interrupt_params = dict(sampling_params)
+                interrupt_params.setdefault("stop", self.stop_sequences)
+                if self.include_stop_str_in_output and self._include_stop_param_supported:
+                    interrupt_params.setdefault("include_stop_str_in_output", True)
 
-            with simple_timer("generate_sequences", metrics):
-                try:
-                    output = await self.server_manager.generate(
-                        request_id=request_id,
-                        prompt_ids=prompt_ids,
-                        sampling_params=interrupt_params,
-                        image_data=None,
-                        video_data=None,
-                    )
-                except Exception as e:
-                    if self._is_include_stop_param_unsupported(e, interrupt_params):
-                        self._include_stop_param_supported = False
-                        logger.warning(
-                            "SamplingParams does not support include_stop_str_in_output; "
-                            "retrying without it for code_interrupt_agent."
-                        )
-                        interrupt_params.pop("include_stop_str_in_output", None)
+                with simple_timer("generate_sequences", metrics):
+                    try:
                         output = await self.server_manager.generate(
                             request_id=request_id,
                             prompt_ids=prompt_ids,
@@ -137,64 +126,86 @@ class CodeInterruptAgentLoop(AgentLoopBase):
                             image_data=None,
                             video_data=None,
                         )
-                    else:
-                        raise
+                    except Exception as e:
+                        if self._is_include_stop_param_unsupported(e, interrupt_params):
+                            self._include_stop_param_supported = False
+                            logger.warning(
+                                "SamplingParams does not support include_stop_str_in_output; "
+                                "retrying without it for code_interrupt_agent."
+                            )
+                            interrupt_params.pop("include_stop_str_in_output", None)
+                            output = await self.server_manager.generate(
+                                request_id=request_id,
+                                prompt_ids=prompt_ids,
+                                sampling_params=interrupt_params,
+                                image_data=None,
+                                video_data=None,
+                            )
+                        else:
+                            raise
 
-            if metrics.get("num_preempted") is None:
-                metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
-            else:
-                metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
+                if metrics.get("num_preempted") is None:
+                    metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+                else:
+                    metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
 
-            assistant_turns += 1
-            generated_ids = output.token_ids
-            if not generated_ids:
-                break
+                assistant_turns += 1
+                generated_ids = output.token_ids
+                if not generated_ids:
+                    break
 
-            prompt_ids += generated_ids
-            response_ids += generated_ids
-            response_mask += [1] * len(generated_ids)
-            if output.log_probs:
-                response_logprobs += output.log_probs
+                prompt_ids += generated_ids
+                response_ids += generated_ids
+                response_mask += [1] * len(generated_ids)
+                if output.log_probs:
+                    response_logprobs += output.log_probs
 
-            generated_text = await self.loop.run_in_executor(
-                None,
-                lambda: self.tokenizer.decode(generated_ids, skip_special_tokens=True),
-            )
-            match = _CODE_RE.search(generated_text)
-            # Fallback when stop string is stripped from output by backend.
-            if (
-                match is None
-                and self._stop_on_code_close
-                and "<code>" in generated_text
-                and not (self.include_stop_str_in_output and self._include_stop_param_supported)
-            ):
-                match = _CODE_RE_OPEN_ENDED.search(generated_text)
-            if match is None or interrupts >= self.max_interrupts:
-                break
+                generated_text = await self.loop.run_in_executor(
+                    None,
+                    lambda: self.tokenizer.decode(generated_ids, skip_special_tokens=True),
+                )
+                match = _CODE_RE.search(generated_text)
+                # Fallback when stop string is stripped from output by backend.
+                if (
+                    match is None
+                    and self._stop_on_code_close
+                    and "<code>" in generated_text
+                    and not (self.include_stop_str_in_output and self._include_stop_param_supported)
+                ):
+                    match = _CODE_RE_OPEN_ENDED.search(generated_text)
+                if match is None or interrupts >= self.max_interrupts:
+                    break
 
-            code = match.group(1).strip()
-            result, tool_reward = await self._execute_code(code=code, tools_kwargs=kwargs.get("tools_kwargs", {}))
-            if tool_reward is not None:
-                tool_rewards.append(tool_reward)
+                code = match.group(1).strip()
+                result, tool_reward = await self._execute_code(
+                    code=code,
+                    instance_id=instance_id,
+                    tool_kwargs=tool_kwargs,
+                )
+                if tool_reward is not None:
+                    tool_rewards.append(tool_reward)
 
-            if len(result) > self.result_max_length:
-                result = result[: self.result_max_length] + "...(truncated)"
-            result_text = f"<result>{result}</result>"
-            result_ids = await self.loop.run_in_executor(
-                None,
-                lambda: self.tokenizer.encode(result_text, add_special_tokens=False),
-            )
+                if len(result) > self.result_max_length:
+                    result = result[: self.result_max_length] + "...(truncated)"
+                result_text = f"<result>{result}</result>"
+                result_ids = await self.loop.run_in_executor(
+                    None,
+                    lambda: self.tokenizer.encode(result_text, add_special_tokens=False),
+                )
 
-            if len(response_mask) + len(result_ids) > self.response_length:
-                break
+                if len(response_mask) + len(result_ids) > self.response_length:
+                    break
 
-            prompt_ids += result_ids
-            response_ids += result_ids
-            response_mask += [0] * len(result_ids)
-            if response_logprobs:
-                response_logprobs += [0.0] * len(result_ids)
+                prompt_ids += result_ids
+                response_ids += result_ids
+                response_mask += [0] * len(result_ids)
+                if response_logprobs:
+                    response_logprobs += [0.0] * len(result_ids)
 
-            interrupts += 1
+                interrupts += 1
+        finally:
+            if instance_id is not None:
+                await self.code_tool.release(instance_id)
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids[: len(prompt_ids) - len(response_ids)],
@@ -207,16 +218,13 @@ class CodeInterruptAgentLoop(AgentLoopBase):
         )
         return output
 
-    async def _execute_code(self, code: str, tools_kwargs: dict[str, Any]) -> tuple[str, float | None]:
+    async def _execute_code(self, code: str, instance_id: str, tool_kwargs: dict[str, Any]) -> tuple[str, float | None]:
         tool = self.code_tool
-        kwargs = tools_kwargs.get(tool.name, {})
-        instance_id = None
         try:
-            instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
             parameters = {"code": code, "language": self.language}
             if self.timeout is not None:
                 parameters["timeout"] = self.timeout
-            tool_resp, tool_reward, _ = await tool.execute(instance_id, parameters, **kwargs)
+            tool_resp, tool_reward, _ = await tool.execute(instance_id, parameters, **tool_kwargs)
             if tool_reward is not None:
                 logger.debug(f"code tool reward: {tool_reward}")
             if isinstance(tool_resp, ToolResponse):
@@ -225,9 +233,6 @@ class CodeInterruptAgentLoop(AgentLoopBase):
         except Exception as e:
             logger.warning(f"Error executing code interrupt tool: {e}")
             return f"Error when executing code: {e}", 0.0
-        finally:
-            if instance_id is not None:
-                await tool.release(instance_id)
 
     @staticmethod
     def _is_include_stop_param_unsupported(error: Exception, sampling_params: dict[str, Any]) -> bool:

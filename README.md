@@ -153,10 +153,11 @@ python3 -m verl.trainer.main_ppo \
 python3 -c "from filesdsl import execute_fdsl; print(execute_fdsl('print(1)', cwd='.', sandbox_root='.'))"
 ```
 
-If you see per-call tool timeouts in rollout workers, ensure FilesDSL runs in-process:
+If you see per-call tool timeouts while still needing segfault isolation, use persistent isolated workers:
 
 ```yaml
-prefer_inprocess_languages: ["fdsl", "filesdsl"]
+use_persistent_isolated_worker: true
+persistent_worker_languages: ["fdsl", "filesdsl"]
 ```
 
 **Running a PPO example step-by-step:**
