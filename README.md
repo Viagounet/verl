@@ -122,10 +122,10 @@ verl is fast with:
 
 ### Quick Start: FilesDSL with `code_interrupt_agent`
 
-1. Install FilesDSL in your runtime:
+1. Install FilesDSL in your runtime (soft-timeout support is required):
 
 ```bash
-pip install "git+https://github.com/Viagounet/FilesDSL.git"
+pip install "git+https://github.com/Viagounet/FilesDSL.git@b74a28ab3cde8d9eb5461946519904bae4a68bb0"
 ```
 
 2. Use the FilesDSL tool config:
@@ -150,14 +150,18 @@ python3 -m verl.trainer.main_ppo \
 4. Optional sanity check:
 
 ```bash
-python3 -c "from filesdsl import execute_fdsl; print(execute_fdsl('print(1)', cwd='.', sandbox_root='.'))"
+python3 -c "from filesdsl import execute_fdsl; print(execute_fdsl('print(1)', cwd='.', sandbox_root='.', timeout_s=5))"
 ```
 
-If you see per-call tool timeouts while still needing segfault isolation, use persistent isolated workers:
+Recommended timeout-related settings:
 
 ```yaml
+default_timeout: 120
+prefer_inprocess_languages: ["fdsl", "filesdsl"]
+force_isolate_languages: ["python"]
 use_persistent_isolated_worker: true
 persistent_worker_languages: ["fdsl", "filesdsl"]
+subprocess_timeout_grace_seconds: 5
 ```
 
 **Running a PPO example step-by-step:**

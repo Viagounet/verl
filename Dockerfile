@@ -14,7 +14,7 @@ ARG VERL_REPO=https://github.com/Viagounet/verl.git
 ARG VERL_REF=main
 ARG VERL_COMMIT_SHA=""
 ARG FILESDSL_REPO=https://github.com/Viagounet/FilesDSL.git
-ARG FILESDSL_REF=main
+ARG FILESDSL_REF=b74a28ab3cde8d9eb5461946519904bae4a68bb0
 ARG FLASH_ATTN_VERSION=2.8.1
 
 ENV PIP_NO_CACHE_DIR=1 \

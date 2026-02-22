@@ -4,13 +4,20 @@ tools:
       type: native
       cwd: "."
       sandbox_root: "."
-      default_timeout: 30
+      # Soft timeout consumed by FilesDSL (timeout_s) + hard timeout guard in this tool.
+      default_timeout: 120
       max_output_chars: 4000
       accepted_languages: ["fdsl", "filesdsl", "python"]
-      # Keep FDSL in isolated subprocesses (segfault guard), but reuse a
-      # persistent worker per tool instance to avoid spawn-on-every-call cost.
+      # Prefer in-process for FilesDSL languages now that soft timeout is available.
+      # Python stays isolated by default.
+      prefer_inprocess_languages: ["fdsl", "filesdsl"]
+      force_isolate_languages: ["python"]
+      # Keep isolated mode fast if you disable in-process.
       use_persistent_isolated_worker: true
       persistent_worker_languages: ["fdsl", "filesdsl"]
+      # Grace period added to hard timeout in subprocess mode so soft-timeout
+      # payloads can be delivered before forced kill.
+      subprocess_timeout_grace_seconds: 5
 
     tool_schema:
       type: "function"
