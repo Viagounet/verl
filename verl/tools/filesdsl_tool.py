@@ -52,6 +52,8 @@ class _FilesDSLTimeoutDetails(Exception):
 def _load_fdsl_runtime():
     from filesdsl import execute_fdsl
 
+    result_queue.put(("ready", ""))
+
     try:
         from filesdsl.errors import DSLTimeoutError
     except Exception:  # pragma: no cover - compatibility fallback
@@ -174,6 +176,7 @@ class FilesDSLTool(BaseTool):
             default=5.0,
         )
         self.subprocess_start_method = str(config.get("subprocess_start_method", "spawn"))
+        self.subprocess_startup_timeout = self._normalize_timeout(config.get("subprocess_startup_timeout", 30))
         self._instance_dict: dict[str, dict[str, Any]] = {}
 
     async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, ToolResponse]:
@@ -491,6 +494,18 @@ class FilesDSLTool(BaseTool):
         process.start()
         hard_timeout = self._get_hard_timeout(timeout)
         try:
+            startup_timeout = self.subprocess_startup_timeout
+            if startup_timeout is None and timeout is not None:
+                startup_timeout = timeout
+
+            if startup_timeout is None:
+                ready_status, _ = result_queue.get()
+            else:
+                ready_status, _ = result_queue.get(timeout=startup_timeout)
+
+            if ready_status != "ready":
+                raise RuntimeError("FilesDSL worker failed to initialize")
+
             # Read result first (with timeout) to avoid queue/pipe backpressure
             # deadlocks when large outputs are emitted from the subprocess.
             # Joining before draining the queue can block until timeout.
